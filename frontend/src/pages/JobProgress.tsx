@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 
 import { api, formatDuration } from '../api'
@@ -22,13 +22,6 @@ export function JobProgress() {
   const [cancelling, setCancelling] = useState(false)
   const [actionError, setActionError] = useState<Error | null>(null)
 
-  useEffect(() => {
-    if (job?.status === 'done') {
-      // A short hold so the completed state is legible rather than a flash.
-      const timer = setTimeout(() => navigate(`/jobs/${job.id}/clips`), 900)
-      return () => clearTimeout(timer)
-    }
-  }, [job?.status, job?.id, navigate])
 
   if (!job) {
     return <p className="pt-24 text-sm text-ink-500">Loading…</p>
@@ -72,6 +65,12 @@ export function JobProgress() {
               {formatDuration(job.source.duration_s)}
               {job.source.width ? ` · ${job.source.width}×${job.source.height}` : ''} ·{' '}
               {job.provider}
+              {job.timings?.pipeline_duration_seconds != null && (
+                <> · Pipeline: {job.timings.pipeline_duration_seconds.toFixed(1)}s</>
+              )}
+              {job.timings?.total_duration_seconds != null && job.timings.stages?.ingest && (
+                <> · Ingest + pipeline: {job.timings.total_duration_seconds.toFixed(1)}s</>
+              )}
             </p>
           )}
         </div>
@@ -134,6 +133,22 @@ export function JobProgress() {
           const fraction =
             state === 'done' ? 1 : state === 'active' ? (progress?.stageProgress ?? 0) : 0
 
+          const timing = job.timings?.stages?.[stage.key]
+          let stageTimingText: string | null = null
+          if (timing) {
+            if (timing.status === 'cached') {
+              stageTimingText = `cached (${timing.duration_seconds.toFixed(1)}s)`
+            } else if (timing.status === 'skipped') {
+              stageTimingText = 'skipped'
+            } else if (timing.status === 'failed') {
+              stageTimingText = `failed (${timing.duration_seconds.toFixed(1)}s)`
+            } else if (timing.status === 'cancelled') {
+              stageTimingText = `cancelled (${timing.duration_seconds.toFixed(1)}s)`
+            } else {
+              stageTimingText = `${timing.duration_seconds.toFixed(1)}s`
+            }
+          }
+
           return (
             <li
               key={stage.key}
@@ -164,6 +179,11 @@ export function JobProgress() {
                     ].join(' ')}
                   >
                     {stage.label}
+                    {stageTimingText && (
+                      <span className="numeric ml-2.5 text-xs text-ink-400">
+                        {stageTimingText}
+                      </span>
+                    )}
                   </span>
                   <span
                     className={`text-xs ${state === 'stopped' ? 'text-signal-bad' : 'text-ink-500'}`}

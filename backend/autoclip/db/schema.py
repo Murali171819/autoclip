@@ -104,9 +104,19 @@ def _migration_v1(conn: sqlite3.Connection) -> None:
     conn.executescript(_V1)
 
 
+_V2 = """
+ALTER TABLE sources ADD COLUMN timings_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE jobs ADD COLUMN timings_json TEXT NOT NULL DEFAULT '{}';
+"""
+
+
+def _migration_v2(conn: sqlite3.Connection) -> None:
+    conn.executescript(_V2)
+
+
 #: Ordered migrations. Index + 1 is the resulting ``user_version``.
 #: Append only — never edit a migration that has shipped.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migration_v1, _migration_v2]
 
 SCHEMA_VERSION = len(MIGRATIONS)
 

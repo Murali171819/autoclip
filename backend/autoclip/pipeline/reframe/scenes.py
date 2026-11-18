@@ -42,6 +42,7 @@ def detect_shots(
     end_s: float | None = None,
     threshold: float = DEFAULT_THRESHOLD,
     min_shot_s: float = MIN_SHOT_S,
+    frame_skip: int = 1,
 ) -> list[Shot]:
     """Return shots within ``[start_s, end_s)``, in clip-relative seconds.
 
@@ -51,7 +52,9 @@ def detect_shots(
     duration = (end_s - start_s) if end_s is not None else None
 
     try:
-        shots = _detect_with_scenedetect(video, start_s, end_s, threshold)
+        shots = _detect_with_scenedetect(
+            video, start_s, end_s, threshold, frame_skip=frame_skip
+        )
     except Exception as exc:
         log.warning("Scene detection failed (%s); treating the clip as one shot.", exc)
         shots = []
@@ -63,19 +66,34 @@ def detect_shots(
 
 
 def _detect_with_scenedetect(
-    video: Path, start_s: float, end_s: float | None, threshold: float
+    video: Path,
+    start_s: float,
+    end_s: float | None,
+    threshold: float,
+    frame_skip: int = 1,
 ) -> list[Shot]:
     from scenedetect import ContentDetector, SceneManager, open_video
 
     stream = open_video(str(video))
-    manager = SceneManager()
-    manager.add_detector(ContentDetector(threshold=threshold))
+    try:
+        manager = SceneManager()
+        manager.add_detector(ContentDetector(threshold=threshold))
 
-    if start_s > 0:
-        stream.seek(start_s)
+        if start_s > 0:
+            stream.seek(start_s)
 
-    manager.detect_scenes(video=stream, end_time=end_s, show_progress=False)
-    scenes = manager.get_scene_list()
+        manager.detect_scenes(
+            video=stream,
+            end_time=end_s,
+            frame_skip=frame_skip,
+            show_progress=False,
+        )
+        scenes = manager.get_scene_list()
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     shots: list[Shot] = []
     for scene_start, scene_end in scenes:

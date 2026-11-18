@@ -34,8 +34,8 @@ def create_source(source: Source) -> Source:
             """
             INSERT INTO sources (id, type, url, filename, path, title, channel,
                                  duration_s, width, height, fps, has_audio,
-                                 has_video, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 has_video, created_at, timings_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source.id,
@@ -52,6 +52,7 @@ def create_source(source: Source) -> Source:
                 int(source.has_audio),
                 int(source.has_video),
                 source.created_at,
+                json.dumps(source.timings),
             ),
         )
     return source
@@ -82,8 +83,8 @@ def create_job(job: Job) -> Job:
             """
             INSERT INTO jobs (id, source_id, status, current_stage, progress, error,
                               provider, settings_json, created_at, updated_at,
-                              started_at, finished_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              started_at, finished_at, timings_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.id,
@@ -98,6 +99,7 @@ def create_job(job: Job) -> Job:
                 job.updated_at,
                 job.started_at,
                 job.finished_at,
+                json.dumps(job.timings),
             ),
         )
     return job
@@ -146,6 +148,7 @@ def update_job(
     error: str | None | _Unset = UNSET,
     started_at: str | None | _Unset = UNSET,
     finished_at: str | None | _Unset = UNSET,
+    timings: dict[str, Any] | None | _Unset = UNSET,
 ) -> None:
     """Patch the supplied fields. Omitted fields are left untouched.
 
@@ -171,12 +174,75 @@ def update_job(
         if not isinstance(value, _Unset):
             fields[name] = value
 
+    if not isinstance(timings, _Unset):
+        fields["timings_json"] = json.dumps(timings if timings is not None else {})
+
     assignments = ", ".join(f"{name} = ?" for name in fields)
     with connection() as conn:
         conn.execute(
             f"UPDATE jobs SET {assignments} WHERE id = ?",
             (*fields.values(), job_id),
         )
+
+
+def record_job_timing(job_id: str, stage_name: str, timing_data: dict[str, Any]) -> dict[str, Any]:
+    """Record or update a single stage's timing on a job safely, preserving existing timings."""
+    with connection() as conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT timings_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return {}
+        try:
+            current_timings = json.loads(row["timings_json"] or "{}")
+            if not isinstance(current_timings, dict):
+                current_timings = {}
+        except (json.JSONDecodeError, TypeError):
+            current_timings = {}
+
+        stages = current_timings.get("stages")
+        if not isinstance(stages, dict):
+            stages = current_timings["stages"] = {}
+        stages[stage_name] = timing_data
+        updated_json = json.dumps(current_timings)
+        conn.execute(
+            "UPDATE jobs SET timings_json = ?, updated_at = ? WHERE id = ?",
+            (updated_json, utcnow(), job_id),
+        )
+        return current_timings
+
+
+def set_job_durations(
+    job_id: str,
+    *,
+    pipeline_duration_seconds: float | None = None,
+    total_duration_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Set pipeline and total durations on a job's timings structure."""
+    with connection() as conn:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT timings_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return {}
+        try:
+            current_timings = json.loads(row["timings_json"] or "{}")
+            if not isinstance(current_timings, dict):
+                current_timings = {}
+        except (json.JSONDecodeError, TypeError):
+            current_timings = {}
+
+        if pipeline_duration_seconds is not None:
+            current_timings["pipeline_duration_seconds"] = max(0.0, round(float(pipeline_duration_seconds), 4))
+        if total_duration_seconds is not None:
+            current_timings["total_duration_seconds"] = max(0.0, round(float(total_duration_seconds), 4))
+
+        updated_json = json.dumps(current_timings)
+        conn.execute(
+            "UPDATE jobs SET timings_json = ?, updated_at = ? WHERE id = ?",
+            (updated_json, utcnow(), job_id),
+        )
+        return current_timings
 
 
 def next_queued_job() -> Job | None:

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 
 import {
   ApiError,
@@ -12,10 +12,10 @@ import {
 import { ErrorNote } from '../components/ErrorNote'
 
 export function Ingest() {
-  const navigate = useNavigate()
   const [url, setUrl] = useState('')
   const [busy, setBusy] = useState<'url' | 'file' | null>(null)
   const [error, setError] = useState<ApiError | Error | null>(null)
+  const [createdJob, setCreatedJob] = useState<Job | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [providers, setProviders] = useState<ProviderStatus[]>([])
   const [overrides, setOverrides] = useState<JobSettingsOverrides>({})
@@ -32,17 +32,20 @@ export function Ingest() {
     async (kind: 'url' | 'file', run: () => Promise<{ id: string }>) => {
       setBusy(kind)
       setError(null)
+      setCreatedJob(null)
       try {
         const source = await run()
         const job = await api.createJob(source.id, overrides)
-        navigate(`/jobs/${job.id}`)
+        setCreatedJob(job)
+        setUrl('')
+        api.listJobs(8).then(setJobs).catch(() => undefined)
       } catch (err) {
         setError(err as Error)
       } finally {
         setBusy(null)
       }
     },
-    [navigate, overrides],
+    [overrides],
   )
 
   const submitUrl = (event: React.FormEvent) => {
@@ -155,6 +158,23 @@ export function Ingest() {
           />
         </section>
       </div>
+
+      {createdJob && (
+        <div className="rise mt-10 flex max-w-3xl flex-wrap items-center justify-between gap-4 border border-ink-800 bg-ink-850/60 p-5">
+          <div className="min-w-0">
+            <p className="eyebrow text-sodium-500">Job created</p>
+            <p className="mt-1 truncate font-display text-xl text-ink-100">
+              {createdJob.source?.title || 'Video job'}
+            </p>
+            <p className="numeric mt-1 text-xs text-ink-500">
+              ID: <span className="text-ink-400">{createdJob.id}</span> · Provider: {createdJob.provider}
+            </p>
+          </div>
+          <Link to={`/jobs/${createdJob.id}`} className="btn btn-primary shrink-0">
+            View Job Progress
+          </Link>
+        </div>
+      )}
 
       {error && (
         <div className="mt-10 max-w-3xl">
@@ -360,20 +380,51 @@ function RecentJobs({ jobs }: { jobs: Job[] }) {
 
       <ul>
         {jobs.map((job) => (
-          <li key={job.id}>
-            <a
-              href={job.status === 'done' ? `/jobs/${job.id}/clips` : `/jobs/${job.id}`}
-              className="group grid grid-cols-[1fr_auto] items-baseline gap-4 border-b border-ink-850 py-4 transition-colors duration-200 hover:bg-ink-850/40 sm:grid-cols-[1fr_7rem_6rem_5rem]"
-            >
-              <span className="truncate text-[0.9375rem] text-ink-200 group-hover:text-ink-100">
+          <li
+            key={job.id}
+            className="group flex flex-col gap-3 border-b border-ink-850 py-4 transition-colors duration-200 hover:bg-ink-850/40 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <div className="min-w-0 flex-1 sm:grid sm:grid-cols-[1fr_6rem_6rem_4.5rem] sm:items-baseline sm:gap-4">
+              <Link
+                to={job.status === 'done' ? `/jobs/${job.id}/clips` : `/jobs/${job.id}`}
+                className="truncate block text-[0.9375rem] text-ink-200 group-hover:text-ink-100"
+              >
                 {job.source?.title || 'Untitled'}
-              </span>
+              </Link>
               <span className="numeric hidden text-xs text-ink-500 sm:block">
                 {job.source ? formatDuration(job.source.duration_s) : '—'}
               </span>
               <span className="hidden text-xs text-ink-500 sm:block">{job.provider}</span>
-              <StatusTag job={job} />
-            </a>
+              <div className="hidden sm:block">
+                <StatusTag job={job} />
+              </div>
+
+              {/* Mobile metadata row */}
+              <div className="numeric mt-1 flex items-center gap-2 text-xs text-ink-500 sm:hidden">
+                <span>{job.source ? formatDuration(job.source.duration_s) : '—'}</span>
+                <span>·</span>
+                <span>{job.provider}</span>
+                <span>·</span>
+                <StatusTag job={job} />
+              </div>
+            </div>
+
+            <div className="flex shrink-0 items-center gap-2">
+              <Link
+                to={`/jobs/${job.id}`}
+                className="btn btn-ghost px-2.5 py-1 text-xs"
+              >
+                View Progress
+              </Link>
+              {job.status === 'done' && (
+                <Link
+                  to={`/jobs/${job.id}/clips`}
+                  className="btn btn-primary px-2.5 py-1 text-xs"
+                >
+                  Review Clips
+                </Link>
+              )}
+            </div>
           </li>
         ))}
       </ul>

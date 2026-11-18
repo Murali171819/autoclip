@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -50,14 +51,28 @@ async def ingest_youtube(payload: YouTubeIngestIn) -> SourceOut:
             update={"cookies_from_browser": payload.cookies_from_browser}
         )
 
+    t0 = time.perf_counter()
     try:
         source = await asyncio.to_thread(ingest.ingest_youtube, payload.url, settings)
+        duration_s = max(0.0, round(time.perf_counter() - t0, 4))
+        source.timings["ingest"] = {
+            "duration_seconds": duration_s,
+            "status": "completed",
+            "details": {"type": "youtube"},
+        }
+        log.info("Source %s | ingest | completed | %.2f seconds", source.id, duration_s)
     except ingest.IngestError as exc:
+        duration_s = max(0.0, round(time.perf_counter() - t0, 4))
+        log.info("Source <unknown> | ingest | failed | %.2f seconds", duration_s)
         # 422 rather than 500: the request was well-formed, but the content
         # can't be fetched, and the hint tells the user what to change.
         raise HTTPException(
             status_code=422, detail={"message": str(exc), "hint": exc.hint}
         ) from exc
+    except Exception:
+        duration_s = max(0.0, round(time.perf_counter() - t0, 4))
+        log.info("Source <unknown> | ingest | failed | %.2f seconds", duration_s)
+        raise
 
     await asyncio.to_thread(store.create_source, source)
     return SourceOut.of(source)
@@ -79,24 +94,53 @@ async def upload_source(file: UploadFile = File(...)) -> SourceOut:
 
     # Stage to a temp file first so a failed or abandoned upload never leaves a
     # half-written file in the media store.
+    t_upload_start = time.perf_counter()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as staging:
         staging_path = Path(staging.name)
         try:
             while chunk := await file.read(UPLOAD_CHUNK):
                 staging.write(chunk)
         except Exception as exc:
+            duration_s = max(0.0, round(time.perf_counter() - t_upload_start, 4))
+            log.info("Source <upload> | ingest | failed | %.2f seconds", duration_s)
             staging_path.unlink(missing_ok=True)
             raise HTTPException(status_code=500, detail="Upload failed.") from exc
 
+    upload_transfer_s = max(0.0, round(time.perf_counter() - t_upload_start, 4))
+    t_process_start = time.perf_counter()
     try:
         source = await asyncio.to_thread(
             ingest.ingest_file, staging_path, move=True, title=filename.stem
         )
+        process_s = max(0.0, round(time.perf_counter() - t_process_start, 4))
+        total_ingest_s = max(0.0, round(time.perf_counter() - t_upload_start, 4))
+        source.timings["ingest"] = {
+            "duration_seconds": total_ingest_s,
+            "status": "completed",
+            "details": {
+                "type": "upload",
+                "upload_transfer_seconds": upload_transfer_s,
+                "file_ingest_seconds": process_s,
+            },
+        }
+        log.info(
+            "Source %s | ingest | completed | %.2f seconds (upload: %.2fs, process: %.2fs)",
+            source.id,
+            total_ingest_s,
+            upload_transfer_s,
+            process_s,
+        )
     except ingest.IngestError as exc:
+        total_ingest_s = max(0.0, round(time.perf_counter() - t_upload_start, 4))
+        log.info("Source <upload> | ingest | failed | %.2f seconds", total_ingest_s)
         staging_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=422, detail={"message": str(exc), "hint": exc.hint}
         ) from exc
+    except Exception:
+        total_ingest_s = max(0.0, round(time.perf_counter() - t_upload_start, 4))
+        log.info("Source <upload> | ingest | failed | %.2f seconds", total_ingest_s)
+        raise
     finally:
         shutil.rmtree(staging_path.parent / staging_path.name, ignore_errors=True)
 

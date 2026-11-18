@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ..db import models
 
@@ -29,6 +29,7 @@ class SourceOut(BaseModel):
     has_audio: bool
     has_video: bool
     created_at: str
+    timings: dict[str, Any] | None = None
 
     @classmethod
     def of(cls, source: models.Source) -> SourceOut:
@@ -48,6 +49,7 @@ class SourceOut(BaseModel):
             has_audio=source.has_audio,
             has_video=source.has_video,
             created_at=source.created_at,
+            timings=source.timings or None,
         )
 
 
@@ -75,6 +77,18 @@ class JobCreateIn(BaseModel):
     settings: JobSettingsIn = Field(default_factory=JobSettingsIn)
 
 
+class StageTiming(BaseModel):
+    duration_seconds: float
+    status: Literal["completed", "failed", "cancelled", "cached", "skipped"]
+    details: dict[str, Any] | None = None
+
+
+class JobTimings(BaseModel):
+    pipeline_duration_seconds: float | None = None
+    total_duration_seconds: float | None = None
+    stages: dict[str, StageTiming] = Field(default_factory=dict)
+
+
 class JobOut(BaseModel):
     id: str
     source_id: str
@@ -88,9 +102,43 @@ class JobOut(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     source: SourceOut | None = None
+    timings: JobTimings | None = None
 
     @classmethod
     def of(cls, job: models.Job, source: models.Source | None = None) -> JobOut:
+        timings_obj: JobTimings | None = None
+        if job.timings and isinstance(job.timings, dict):
+            try:
+                timings_obj = JobTimings.model_validate(job.timings)
+            except ValidationError:
+                stages_dict: dict[str, StageTiming] = {}
+                raw_stages = job.timings.get("stages")
+                stages_map = raw_stages if isinstance(raw_stages, dict) else {}
+                for k, v in stages_map.items():
+                    if isinstance(v, dict) and "duration_seconds" in v and "status" in v:
+                        try:
+                            stages_dict[k] = StageTiming(**v)
+                        except ValidationError:
+                            pass
+
+                pipeline_dur = job.timings.get("pipeline_duration_seconds")
+                try:
+                    pipeline_dur = float(pipeline_dur) if pipeline_dur is not None else None
+                except (ValueError, TypeError):
+                    pipeline_dur = None
+
+                total_dur = job.timings.get("total_duration_seconds")
+                try:
+                    total_dur = float(total_dur) if total_dur is not None else None
+                except (ValueError, TypeError):
+                    total_dur = None
+
+                timings_obj = JobTimings(
+                    pipeline_duration_seconds=pipeline_dur,
+                    total_duration_seconds=total_dur,
+                    stages=stages_dict,
+                )
+
         return cls(
             id=job.id,
             source_id=job.source_id,
@@ -104,6 +152,7 @@ class JobOut(BaseModel):
             started_at=job.started_at,
             finished_at=job.finished_at,
             source=SourceOut.of(source) if source else None,
+            timings=timings_obj,
         )
 
 

@@ -82,6 +82,8 @@ def build_crop_path(
     end_s: float,
     transcript: Transcript | None = None,
     config: ReframeConfig | None = None,
+    media_info: ffmpeg.MediaInfo | None = None,
+    shots: list[Shot] | None = None,
 ) -> CropPath:
     """Compute the crop path for one clip.
 
@@ -94,7 +96,7 @@ def build_crop_path(
     config = config or ReframeConfig()
     duration = end_s - start_s
 
-    info = ffmpeg.probe(video)
+    info = media_info if media_info is not None else ffmpeg.probe(video)
     if not info.has_video or not info.width or not info.height:
         raise ValueError(f"{video.name} has no video stream to reframe.")
 
@@ -133,7 +135,8 @@ def build_crop_path(
         )
 
     tracks = build_tracks(observations)
-    shots = detect_shots(video, start_s=start_s, end_s=end_s)
+    if shots is None:
+        shots = detect_shots(video, start_s=start_s, end_s=end_s)
 
     turns = _clip_relative_turns(transcript, start_s, end_s)
     speaker_map = map_tracks_to_speakers(tracks, turns) if turns else {}

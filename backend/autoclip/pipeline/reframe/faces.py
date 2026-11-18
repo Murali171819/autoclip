@@ -161,15 +161,19 @@ def _iter_frames(
         # Timestamps come from the frame index rather than CAP_PROP_POS_MSEC,
         # which drifts on variable-frame-rate sources.
         while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
             if end_frame is not None and frame_index >= end_frame:
                 break
 
             if (frame_index - start_frame) % step == 0:
+                ok, frame = capture.read()
+                if not ok:
+                    break
                 timestamp = (frame_index / source_fps) - start_s
                 yield timestamp, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), width, height
+            else:
+                ok = capture.grab()
+                if not ok:
+                    break
 
             frame_index += 1
     finally:

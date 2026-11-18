@@ -46,6 +46,7 @@ def static_dir() -> Path | None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     import asyncio
 
+    logging.getLogger("autoclip").setLevel(logging.INFO)
     paths.ensure_layout()
     db.init()
 

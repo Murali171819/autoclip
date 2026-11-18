@@ -12,8 +12,10 @@ same runner serves the CLI (a progress bar) and the web API (an SSE stream).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +123,82 @@ class PipelineRunner:
         self.workspace = JobWorkspace(job.id)
         self._completed_weight = 0.0
 
+    # -- timing ------------------------------------------------------------
+
+    def _get_ingest_duration(self) -> float | None:
+        stages = self.job.timings.get("stages", {}) if self.job.timings else {}
+        ingest_stage = stages.get("ingest")
+        if isinstance(ingest_stage, dict) and "duration_seconds" in ingest_stage:
+            try:
+                return float(ingest_stage["duration_seconds"])
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    def _record_timing(
+        self,
+        stage_name: str,
+        status: str,
+        duration_seconds: float,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        duration_val = max(0.0, round(float(duration_seconds), 4))
+        timing_data: dict[str, Any] = {
+            "duration_seconds": duration_val,
+            "status": status,
+        }
+        if details:
+            timing_data["details"] = json.loads(json.dumps(details, default=str))
+        self.job.timings = store.record_job_timing(self.job.id, stage_name, timing_data)
+        log.info(
+            "Job %s | %s | %s | %.2f seconds",
+            self.job.id,
+            stage_name,
+            status,
+            duration_val,
+        )
+
+    def _record_final_durations(self, pipeline_duration: float) -> float:
+        ingest_s = self._get_ingest_duration()
+        pipeline_val = max(0.0, round(float(pipeline_duration), 4))
+        total_duration = round(pipeline_val + (ingest_s or 0.0), 4)
+        self.job.timings = store.set_job_durations(
+            self.job.id,
+            pipeline_duration_seconds=pipeline_val,
+            total_duration_seconds=max(0.0, total_duration),
+        )
+        return total_duration
+
+    @contextlib.contextmanager
+    def _time_stage(self, stage_name: str):
+        t0 = time.perf_counter()
+        ctx: dict[str, Any] = {"status": "completed", "details": None, "include_duration": 0.0}
+        try:
+            yield ctx
+        except JobCancelled:
+            elapsed = max(0.0, time.perf_counter() - t0 + ctx.get("include_duration", 0.0))
+            try:
+                self._record_timing(stage_name, "cancelled", elapsed, details=ctx.get("details"))
+            except Exception as record_err:
+                log.warning("Failed to record cancelled timing for %s: %s", stage_name, record_err)
+            raise
+        except Exception:
+            elapsed = max(0.0, time.perf_counter() - t0 + ctx.get("include_duration", 0.0))
+            try:
+                self._record_timing(stage_name, "failed", elapsed, details=ctx.get("details"))
+            except Exception as record_err:
+                log.warning("Failed to record failed timing for %s: %s", stage_name, record_err)
+            raise
+        else:
+            elapsed = max(0.0, time.perf_counter() - t0 + ctx.get("include_duration", 0.0))
+            self._record_timing(
+                stage_name,
+                ctx.get("status", "completed"),
+                elapsed,
+                details=ctx.get("details"),
+            )
+
     # -- progress ----------------------------------------------------------
 
     def _check_cancelled(self) -> None:
@@ -170,24 +248,56 @@ class PipelineRunner:
 
     async def run(self) -> list[Clip]:
         """Run the full pipeline and return the exported clips."""
+        pipeline_t0 = time.perf_counter()
         store.update_job(self.job.id, status="running", started_at=utcnow(), error=None)
 
         try:
             audio = self._stage_prepare()
             transcript = self._stage_transcribe(audio)
-            silences = self._load_or_detect_silences(audio)
-            clips = await self._stage_highlights(transcript, silences)
+            clips = await self._stage_highlights(transcript, audio=audio)
             crop_paths = self._stage_reframe(clips, transcript)
             self._stage_captions(clips, transcript)
             self._stage_export(clips, transcript, crop_paths)
         except JobCancelled:
+            pipeline_duration = max(0.0, round(time.perf_counter() - pipeline_t0, 4))
+            try:
+                total_duration = self._record_final_durations(pipeline_duration)
+            except Exception as rec_err:
+                log.warning("Failed to record final durations on cancel: %s", rec_err)
+                total_duration = pipeline_duration
+            log.info(
+                "Job %s | pipeline | cancelled | %.2f seconds (total with ingest: %.2f seconds)",
+                self.job.id,
+                pipeline_duration,
+                total_duration,
+            )
             store.update_job(self.job.id, status="cancelled", finished_at=utcnow(), progress=0.0)
             raise
         except Exception as exc:
+            pipeline_duration = max(0.0, round(time.perf_counter() - pipeline_t0, 4))
+            try:
+                total_duration = self._record_final_durations(pipeline_duration)
+            except Exception as rec_err:
+                log.warning("Failed to record final durations on failure: %s", rec_err)
+                total_duration = pipeline_duration
+            log.info(
+                "Job %s | pipeline | failed | %.2f seconds (total with ingest: %.2f seconds)",
+                self.job.id,
+                pipeline_duration,
+                total_duration,
+            )
             log.exception("Job %s failed.", self.job.id)
             store.update_job(self.job.id, status="failed", error=str(exc), finished_at=utcnow())
             raise
 
+        pipeline_duration = round(time.perf_counter() - pipeline_t0, 4)
+        total_duration = self._record_final_durations(pipeline_duration)
+        log.info(
+            "Job %s | pipeline | completed | %.2f seconds (total with ingest: %.2f seconds)",
+            self.job.id,
+            pipeline_duration,
+            total_duration,
+        )
         store.update_job(self.job.id, status="done", progress=1.0, finished_at=utcnow())
         return clips
 
@@ -198,154 +308,230 @@ class PipelineRunner:
         self._check_cancelled()
         source_path = Path(self.source.path)
 
-        if self.workspace.audio.exists() and self.workspace.audio.stat().st_size > 0:
-            log.info("Reusing existing audio for job %s.", self.job.id)
-        else:
-            self._emit(stage, 0.0, "Extracting audio")
-            prepare.extract_audio(
-                source_path,
-                self.workspace.audio,
-                duration_s=self.source.duration_s,
-                on_progress=self._stage_progress(stage),
-            )
+        with self._time_stage(stage.value) as timer_ctx:
+            is_audio_cached = self.workspace.audio.exists() and self.workspace.audio.stat().st_size > 0
+            is_thumbs_cached = (not self.source.has_video) or self.workspace.thumbnails.exists()
 
-        if self.source.has_video and not self.workspace.thumbnails.exists():
-            prepare.generate_thumbnails(source_path, self.workspace.thumbnails)
+            if is_audio_cached:
+                log.info("Reusing existing audio for job %s.", self.job.id)
+            else:
+                self._emit(stage, 0.0, "Extracting audio")
+                prepare.extract_audio(
+                    source_path,
+                    self.workspace.audio,
+                    duration_s=self.source.duration_s,
+                    on_progress=self._stage_progress(stage),
+                )
 
-        self._finish_stage(stage)
-        return self.workspace.audio
+            if self.source.has_video and not self.workspace.thumbnails.exists():
+                prepare.generate_thumbnails(source_path, self.workspace.thumbnails)
+
+            if is_audio_cached and is_thumbs_cached:
+                timer_ctx["status"] = "cached"
+
+            self._finish_stage(stage)
+            return self.workspace.audio
 
     def _stage_transcribe(self, audio: Path) -> Transcript:
         stage = Stage.TRANSCRIBE
         self._check_cancelled()
 
-        if self.workspace.transcript.exists():
-            log.info("Reusing existing transcript for job %s.", self.job.id)
-            transcript = Transcript.load(self.workspace.transcript)
+        with self._time_stage(stage.value) as timer_ctx:
+            if self.workspace.transcript.exists():
+                log.info("Reusing existing transcript for job %s.", self.job.id)
+                transcript = Transcript.load(self.workspace.transcript)
+                timer_ctx["status"] = "cached"
+                timer_ctx["details"] = {
+                    "word_count": len(transcript.words),
+                    "has_diarization": transcript.has_diarization,
+                }
+                self._finish_stage(stage)
+                return transcript
+
+            self._emit(stage, 0.0, "Transcribing")
+            transcript = transcribe.transcribe(
+                audio,
+                self.settings.whisper,
+                duration_s=self.source.duration_s,
+                on_progress=self._stage_progress(stage),
+            )
+
+            if self.settings.whisper.diarization:
+                from ..config import HF_TOKEN_KEY, get_secret
+
+                self._emit(stage, 0.95, "Identifying speakers")
+                transcribe.diarize(audio, transcript, hf_token=get_secret(HF_TOKEN_KEY, self.settings))
+
+            transcript.save(self.workspace.transcript)
+            store.upsert_transcript(
+                TranscriptRow(
+                    job_id=self.job.id,
+                    json_path=str(self.workspace.transcript),
+                    language=transcript.language,
+                    model=transcript.model,
+                    has_diarization=transcript.has_diarization,
+                    word_count=len(transcript.words),
+                    source=transcript.source,
+                )
+            )
+
+            timer_ctx["details"] = {
+                "word_count": len(transcript.words),
+                "has_diarization": transcript.has_diarization,
+            }
             self._finish_stage(stage)
             return transcript
 
-        self._emit(stage, 0.0, "Transcribing")
-        transcript = transcribe.transcribe(
-            audio,
-            self.settings.whisper,
-            duration_s=self.source.duration_s,
-            on_progress=self._stage_progress(stage),
-            cancelled=self._is_cancelled,
-        )
-
-        if self.settings.whisper.diarization:
-            from ..config import HF_TOKEN_KEY, get_secret
-
-            self._emit(stage, 0.95, "Identifying speakers")
-            transcribe.diarize(audio, transcript, hf_token=get_secret(HF_TOKEN_KEY, self.settings))
-
-        transcript.save(self.workspace.transcript)
-        store.upsert_transcript(
-            TranscriptRow(
-                job_id=self.job.id,
-                json_path=str(self.workspace.transcript),
-                language=transcript.language,
-                model=transcript.model,
-                has_diarization=transcript.has_diarization,
-                word_count=len(transcript.words),
-                source=transcript.source,
-            )
-        )
-
-        self._finish_stage(stage)
-        return transcript
-
-    def _load_or_detect_silences(self, audio: Path) -> list[Silence]:
+    def _load_or_detect_silences(self, audio: Path) -> tuple[list[Silence], float, bool]:
+        t0 = time.perf_counter()
         if self.workspace.silences.exists():
             raw = json.loads(self.workspace.silences.read_text(encoding="utf-8"))
-            return [Silence(**item) for item in raw]
+            elapsed = time.perf_counter() - t0
+            return [Silence(**item) for item in raw], elapsed, True
 
         silences = prepare.detect_silences(audio)
         self.workspace.silences.write_text(
             json.dumps([{"start": s.start, "end": s.end} for s in silences]),
             encoding="utf-8",
         )
-        return silences
+        elapsed = time.perf_counter() - t0
+        return silences, elapsed, False
 
     async def _stage_highlights(
-        self, transcript: Transcript, silences: list[Silence]
+        self,
+        transcript: Transcript,
+        silences: list[Silence] | None = None,
+        *,
+        audio: Path | None = None,
+        silence_seconds: float = 0.0,
+        silence_cached: bool = False,
     ) -> list[Clip]:
         stage = Stage.HIGHLIGHTS
         self._check_cancelled()
 
-        existing = store.list_clips(self.job.id)
-        if existing:
-            log.info("Reusing %d existing clips for job %s.", len(existing), self.job.id)
+        with self._time_stage(stage.value) as timer_ctx:
+            if silences is None:
+                audio_path = audio or self.workspace.audio
+                silences, silence_seconds, silence_cached = self._load_or_detect_silences(audio_path)
+            else:
+                timer_ctx["include_duration"] = max(0.0, silence_seconds)
+
+            existing = store.list_clips(self.job.id)
+            if existing:
+                log.info("Reusing %d existing clips for job %s.", len(existing), self.job.id)
+                timer_ctx["status"] = "cached"
+                timer_ctx["details"] = {
+                    "clip_count": len(existing),
+                    "silence_detection_seconds": round(max(0.0, silence_seconds), 4),
+                    "silence_status": "cached" if silence_cached else "completed",
+                }
+                self._finish_stage(stage)
+                return existing
+
+            provider_name = self.job.provider or self.settings.active_provider
+            provider = build_provider(provider_name, self.settings)
+            config = detection_config(self.settings)
+
+            self._emit(stage, 0.0, f"Finding highlights with {provider.name}")
+            t_detect = time.perf_counter()
+            clips = await highlights.detect(
+                transcript,
+                provider,
+                config,
+                job_id=self.job.id,
+                silences=silences,
+                on_progress=self._stage_progress(stage),
+            )
+            detect_duration = max(0.0, time.perf_counter() - t_detect)
+
+            store.replace_clips(self.job.id, clips)
+            timer_ctx["details"] = {
+                "clip_count": len(clips),
+                "silence_detection_seconds": round(max(0.0, silence_seconds), 4),
+                "silence_status": "cached" if silence_cached else "completed",
+                "detection_seconds": round(detect_duration, 4),
+            }
             self._finish_stage(stage)
-            return existing
-
-        provider_name = self.job.provider or self.settings.active_provider
-        provider = build_provider(provider_name, self.settings)
-        config = detection_config(self.settings)
-
-        self._emit(stage, 0.0, f"Finding highlights with {provider.name}")
-        clips = await highlights.detect(
-            transcript,
-            provider,
-            config,
-            job_id=self.job.id,
-            silences=silences,
-            on_progress=self._stage_progress(stage),
-        )
-
-        store.replace_clips(self.job.id, clips)
-        self._finish_stage(stage)
-        return clips
+            return clips
 
     def _stage_reframe(self, clips: list[Clip], transcript: Transcript) -> dict[str, CropPath]:
         stage = Stage.REFRAME
         self._check_cancelled()
         source_path = Path(self.source.path)
 
-        crop_paths: dict[str, CropPath] = {}
+        with self._time_stage(stage.value) as timer_ctx:
+            crop_paths: dict[str, CropPath] = {}
 
-        if not self.source.has_video:
-            # Audio-only sources render as captions on a solid background, so
-            # there is nothing to reframe.
+            if not self.source.has_video:
+                # Audio-only sources render as captions on a solid background, so
+                # there is nothing to reframe.
+                timer_ctx["status"] = "skipped"
+                timer_ctx["details"] = {"reason": "audio_only"}
+                self._finish_stage(stage)
+                return crop_paths
+
+            config = ReframeConfig(
+                aspect_w=9 if self.settings.export.ratio == "9:16" else 1,
+                aspect_h=16 if self.settings.export.ratio == "9:16" else 1,
+            )
+            if self.settings.export.ratio == "16:9":
+                config = ReframeConfig(aspect_w=16, aspect_h=9)
+
+            cached_count = 0
+            reframed_count = 0
+            media_info: ffmpeg.MediaInfo | None = None
+            if self.source.width and self.source.height:
+                media_info = ffmpeg.MediaInfo(
+                    path=source_path,
+                    duration_s=self.source.duration_s,
+                    has_video=self.source.has_video,
+                    has_audio=self.source.has_audio,
+                    width=self.source.width,
+                    height=self.source.height,
+                    fps=self.source.fps or 30.0,
+                )
+
+            for index, clip in enumerate(clips):
+                self._check_cancelled()
+                cached = self.workspace.crop_path(clip.id)
+                if cached.exists():
+                    crop_paths[clip.id] = CropPath.load(cached)
+                    cached_count += 1
+                else:
+                    crop_paths[clip.id] = build_crop_path(
+                        source_path,
+                        start_s=clip.start_s,
+                        end_s=clip.end_s,
+                        transcript=transcript,
+                        config=config,
+                        media_info=media_info,
+                    )
+                    crop_paths[clip.id].save(cached)
+                    reframed_count += 1
+
+                self._emit(stage, (index + 1) / len(clips), f"Reframing clip {index + 1}")
+
+            if clips and cached_count == len(clips):
+                timer_ctx["status"] = "cached"
+
+            timer_ctx["details"] = {
+                "clip_count": len(clips),
+                "cached_clips": cached_count,
+                "reframed_clips": reframed_count,
+            }
             self._finish_stage(stage)
             return crop_paths
-
-        config = ReframeConfig(
-            aspect_w=9 if self.settings.export.ratio == "9:16" else 1,
-            aspect_h=16 if self.settings.export.ratio == "9:16" else 1,
-        )
-        if self.settings.export.ratio == "16:9":
-            config = ReframeConfig(aspect_w=16, aspect_h=9)
-
-        for index, clip in enumerate(clips):
-            self._check_cancelled()
-            cached = self.workspace.crop_path(clip.id)
-            if cached.exists():
-                crop_paths[clip.id] = CropPath.load(cached)
-            else:
-                crop_paths[clip.id] = build_crop_path(
-                    source_path,
-                    start_s=clip.start_s,
-                    end_s=clip.end_s,
-                    transcript=transcript,
-                    config=config,
-                )
-                crop_paths[clip.id].save(cached)
-
-            self._emit(stage, (index + 1) / len(clips), f"Reframing clip {index + 1}")
-
-        self._finish_stage(stage)
-        return crop_paths
 
     def _stage_captions(self, clips: list[Clip], transcript: Transcript) -> None:
         stage = Stage.CAPTIONS
         self._check_cancelled()
-        # Caption files are written during export, where the output dimensions
-        # are known. This stage validates the style so a typo fails fast rather
-        # than after the reframe work is already done.
-        captions.get_style(self.settings.export.caption_style)
-        self._finish_stage(stage)
+        with self._time_stage(stage.value) as timer_ctx:
+            # Caption files are written during export, where the output dimensions
+            # are known. This stage validates the style so a typo fails fast rather
+            # than after the reframe work is already done.
+            captions.get_style(self.settings.export.caption_style)
+            timer_ctx["details"] = {"style": self.settings.export.caption_style}
+            self._finish_stage(stage)
 
     def _stage_export(
         self,
@@ -356,56 +542,58 @@ class PipelineRunner:
         stage = Stage.EXPORT
         self._check_cancelled()
 
-        style = captions.get_style(self.settings.export.caption_style)
-        ratio = self.settings.export.ratio
-        source_path = Path(self.source.path)
-        destination_dir = paths.exports_dir() / self.job.id
-        destination_dir.mkdir(parents=True, exist_ok=True)
+        with self._time_stage(stage.value) as timer_ctx:
+            style = captions.get_style(self.settings.export.caption_style)
+            ratio = self.settings.export.ratio
+            source_path = Path(self.source.path)
+            destination_dir = paths.exports_dir() / self.job.id
+            destination_dir.mkdir(parents=True, exist_ok=True)
 
-        for index, clip in enumerate(clips):
-            self._check_cancelled()
+            for index, clip in enumerate(clips):
+                self._check_cancelled()
 
-            crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
-            words = transcript.slice(clip.start_word, clip.end_word)
-            destination = destination_dir / export.output_filename(
-                clip.title or f"clip-{clip.rank}", ratio
-            )
-
-            request = export.ExportRequest(
-                source=source_path,
-                destination=destination,
-                start_s=clip.start_s,
-                end_s=clip.end_s,
-                crop_path=crop_path,
-                words=words,
-                style=style,
-                ratio=ratio,
-            )
-
-            def clip_progress(fraction: float, i: int = index) -> None:
-                self._emit(stage, (i + fraction) / len(clips), f"Exporting clip {i + 1}")
-
-            export.export_clip(
-                request,
-                work_dir=self.workspace.captions_dir,
-                settings=self.settings.export,
-                on_progress=clip_progress,
-                cancelled=self._is_cancelled,
-            )
-
-            store.create_export(
-                Export(
-                    id=new_id(),
-                    clip_id=clip.id,
-                    path=str(destination),
-                    ratio=ratio,
-                    style=style.key,
-                    size_bytes=destination.stat().st_size,
+                crop_path = crop_paths.get(clip.id) or self._fallback_crop_path(clip, ratio)
+                words = transcript.slice(clip.start_word, clip.end_word)
+                destination = destination_dir / export.output_filename(
+                    clip.title or f"clip-{clip.rank}", ratio
                 )
-            )
-            store.update_clip(clip.id, status="exported")
 
-        self._finish_stage(stage)
+                request = export.ExportRequest(
+                    source=source_path,
+                    destination=destination,
+                    start_s=clip.start_s,
+                    end_s=clip.end_s,
+                    crop_path=crop_path,
+                    words=words,
+                    style=style,
+                    ratio=ratio,
+                )
+
+                def clip_progress(fraction: float, i: int = index) -> None:
+                    self._emit(stage, (i + fraction) / len(clips), f"Exporting clip {i + 1}")
+
+                export.export_clip(
+                    request,
+                    work_dir=self.workspace.captions_dir,
+                    settings=self.settings.export,
+                    on_progress=clip_progress,
+                    cancelled=self._is_cancelled,
+                )
+
+                store.create_export(
+                    Export(
+                        id=new_id(),
+                        clip_id=clip.id,
+                        path=str(destination),
+                        ratio=ratio,
+                        style=style.key,
+                        size_bytes=destination.stat().st_size,
+                    )
+                )
+                store.update_clip(clip.id, status="exported")
+
+            timer_ctx["details"] = {"clip_count": len(clips)}
+            self._finish_stage(stage)
 
     def _fallback_crop_path(self, clip: Clip, ratio: str) -> CropPath:
         """Centre crop for sources with no reframe data (audio-only, or a failure)."""

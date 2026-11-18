@@ -186,9 +186,15 @@ def probe(path: Path) -> MediaInfo:
     if video is not None and video.get("disposition", {}).get("attached_pic"):
         video = None
 
+    duration_s = _parse_duration(fmt.get("duration"))
+    if duration_s <= 0 and video is not None:
+        duration_s = _parse_duration(video.get("duration"))
+    if duration_s <= 0 and audio is not None:
+        duration_s = _parse_duration(audio.get("duration"))
+
     info = MediaInfo(
         path=path,
-        duration_s=float(fmt.get("duration") or 0.0),
+        duration_s=duration_s,
         has_video=video is not None,
         has_audio=audio is not None,
         title=(fmt.get("tags") or {}).get("title"),
@@ -210,6 +216,17 @@ def _as_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _parse_duration(value: object) -> float:
+    """Safely parse ffprobe duration into seconds, handling 'N/A', None, and invalid strings."""
+    if not value or value == "N/A":
+        return 0.0
+    try:
+        val = float(value)  # type: ignore[arg-type]
+        return val if val >= 0 else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def _parse_fps(rate: str | None) -> float | None:

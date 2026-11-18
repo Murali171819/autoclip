@@ -109,6 +109,24 @@ class TestRelativeFilterWorkspace:
         assert (workspace / fonts_name / "Anton-Regular.ttf").exists()
 
 
+class TestDurationParsing:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("12.34", 12.34),
+            ("0", 0.0),
+            ("100.000000", 100.0),
+            (50, 50.0),
+        ],
+    )
+    def test_valid_durations(self, raw, expected) -> None:
+        assert ffmpeg._parse_duration(raw) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw", ["N/A", "", None, "invalid", -1.0])
+    def test_invalid_durations_default_to_zero(self, raw) -> None:
+        assert ffmpeg._parse_duration(raw) == 0.0
+
+
 class TestFpsParsing:
     @pytest.mark.parametrize(
         ("rate", "expected"),

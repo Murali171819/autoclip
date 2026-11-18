@@ -58,11 +58,16 @@ async def create_job(payload: JobCreateIn) -> JobOut:
             status_code=400, detail="Minimum clip length must be below the maximum."
         )
 
+    job_timings: dict[str, Any] = {}
+    if source.timings and "ingest" in source.timings:
+        job_timings["stages"] = {"ingest": source.timings["ingest"]}
+
     job = Job(
         id=new_id(),
         source_id=source.id,
         provider=settings.active_provider,
         settings=settings.model_dump(mode="json"),
+        timings=job_timings,
     )
     await asyncio.to_thread(store.create_job, job)
     queue.notify()

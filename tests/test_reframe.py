@@ -402,3 +402,133 @@ def _evaluate(expression: str, t: float) -> float:
             "t": t,
         },
     )
+
+
+class TestReframeOptimizations:
+    def test_iter_frames_uses_grab_for_skipped_frames(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+        import numpy as np
+        from autoclip.pipeline.reframe.faces import _iter_frames
+
+        # Mock cv2 and VideoCapture
+        mock_cv2 = MagicMock()
+        mock_cv2.CAP_PROP_FPS = 1
+        mock_cv2.CAP_PROP_FRAME_WIDTH = 2
+        mock_cv2.CAP_PROP_FRAME_HEIGHT = 3
+        mock_cv2.CAP_PROP_POS_FRAMES = 4
+        mock_cv2.COLOR_BGR2RGB = 5
+        mock_cv2.cvtColor.side_effect = lambda frame, code: frame
+
+        mock_capture = MagicMock()
+        mock_capture.isOpened.return_value = True
+        mock_capture.get.side_effect = lambda prop: {1: 30.0, 2: 1920.0, 3: 1080.0}.get(prop, 0.0)
+
+        fake_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        mock_capture.read.return_value = (True, fake_frame)
+        mock_capture.grab.return_value = True
+        mock_cv2.VideoCapture.return_value = mock_capture
+
+        from pathlib import Path
+        video_path = Path("fake_video.mp4")
+
+        # Range 0.0 to 0.4s at 30 fps = 12 frames (0 to 11).
+        # sample_fps = 5.0 -> step = 6.
+        # Sampled frames: index 0 and index 6 (2 frames).
+        # Skipped frames: indices 1, 2, 3, 4, 5, 7, 8, 9, 10, 11 (10 frames).
+        yielded = list(_iter_frames(mock_cv2, video_path, start_s=0.0, end_s=0.4, sample_fps=5.0))
+
+        assert len(yielded) == 2
+        assert mock_capture.read.call_count == 2
+        assert mock_capture.grab.call_count == 10
+        mock_capture.release.assert_called_once()
+
+    def test_detect_shots_passes_frame_skip(self, monkeypatch) -> None:
+        from autoclip.pipeline.reframe import scenes
+        from pathlib import Path
+
+        called_kwargs = {}
+
+        def fake_detect_with_scenedetect(video, start_s, end_s, threshold, frame_skip=1):
+            called_kwargs["frame_skip"] = frame_skip
+            return [scenes.Shot(0.0, 5.0)]
+
+        monkeypatch.setattr(scenes, "_detect_with_scenedetect", fake_detect_with_scenedetect)
+
+        shots = scenes.detect_shots(Path("fake.mp4"), start_s=0.0, end_s=5.0)
+        assert len(shots) == 1
+        assert called_kwargs["frame_skip"] == 1
+
+        scenes.detect_shots(Path("fake.mp4"), start_s=0.0, end_s=5.0, frame_skip=0)
+        assert called_kwargs["frame_skip"] == 0
+
+    def test_detect_with_scenedetect_closes_stream_on_failure(self, monkeypatch) -> None:
+        import sys
+        from unittest.mock import MagicMock
+        from autoclip.pipeline.reframe import scenes
+        from pathlib import Path
+
+        mock_stream = MagicMock()
+        mock_open_video = MagicMock(return_value=mock_stream)
+        mock_manager_cls = MagicMock()
+        mock_manager = MagicMock()
+        mock_manager.detect_scenes.side_effect = RuntimeError("Detection crashed")
+        mock_manager_cls.return_value = mock_manager
+
+        mock_scenedetect = MagicMock()
+        mock_scenedetect.open_video = mock_open_video
+        mock_scenedetect.SceneManager = mock_manager_cls
+        mock_scenedetect.ContentDetector = MagicMock()
+
+        monkeypatch.setitem(sys.modules, "scenedetect", mock_scenedetect)
+
+        with pytest.raises(RuntimeError, match="Detection crashed"):
+            scenes._detect_with_scenedetect(Path("fake.mp4"), 0.0, 5.0, 27.0, frame_skip=1)
+
+        mock_stream.close.assert_called_once()
+
+    def test_build_crop_path_reuses_media_info_and_shots(self, monkeypatch) -> None:
+        from autoclip.pipeline import ffmpeg
+        from autoclip.pipeline.reframe import build_crop_path, ReframeConfig
+        from autoclip.pipeline.reframe.scenes import Shot
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        probe_called = False
+        def fake_probe(video):
+            nonlocal probe_called
+            probe_called = True
+            return ffmpeg.MediaInfo(
+                path=video, duration_s=10.0, width=1920, height=1080, fps=30.0, has_video=True, has_audio=True
+            )
+
+        monkeypatch.setattr(ffmpeg, "probe", fake_probe)
+
+        detect_shots_called = False
+        def fake_detect_shots(*args, **kwargs):
+            nonlocal detect_shots_called
+            detect_shots_called = True
+            return [Shot(0.0, 5.0)]
+
+        from autoclip.pipeline import reframe
+        monkeypatch.setattr(reframe, "detect_shots", fake_detect_shots)
+
+        # Pre-computed media_info and shots
+        precomputed_info = ffmpeg.MediaInfo(
+            path=Path("dummy.mp4"), duration_s=10.0, width=1920, height=1080, fps=30.0, has_video=True, has_audio=True
+        )
+        precomputed_shots = [Shot(0.0, 5.0)]
+
+        # Run with centre_only to avoid needing models
+        path = build_crop_path(
+            Path("dummy.mp4"),
+            start_s=0.0,
+            end_s=5.0,
+            config=ReframeConfig(centre_only=True),
+            media_info=precomputed_info,
+            shots=precomputed_shots,
+        )
+
+        assert path.duration_s == 5.0
+        assert not probe_called, "ffmpeg.probe should not be called when media_info is provided"
+        assert not detect_shots_called, "detect_shots should not be called when shots is provided"
+

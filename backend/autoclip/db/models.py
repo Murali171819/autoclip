@@ -45,9 +45,18 @@ class Source:
     has_audio: bool = True
     has_video: bool = True
     created_at: str = field(default_factory=utcnow)
+    timings: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Source:
+        timings_raw = row["timings_json"] if "timings_json" in row.keys() else "{}"
+        try:
+            timings = json.loads(timings_raw or "{}")
+            if not isinstance(timings, dict):
+                timings = {}
+        except (json.JSONDecodeError, TypeError):
+            timings = {}
+
         return cls(
             id=row["id"],
             type=row["type"],
@@ -63,6 +72,7 @@ class Source:
             has_audio=bool(row["has_audio"]),
             has_video=bool(row["has_video"]),
             created_at=row["created_at"],
+            timings=timings,
         )
 
 
@@ -80,9 +90,18 @@ class Job:
     updated_at: str = field(default_factory=utcnow)
     started_at: str | None = None
     finished_at: str | None = None
+    timings: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Job:
+        timings_raw = row["timings_json"] if "timings_json" in row.keys() else "{}"
+        try:
+            timings = json.loads(timings_raw or "{}")
+            if not isinstance(timings, dict):
+                timings = {}
+        except (json.JSONDecodeError, TypeError):
+            timings = {}
+
         return cls(
             id=row["id"],
             source_id=row["source_id"],
@@ -96,6 +115,7 @@ class Job:
             updated_at=row["updated_at"],
             started_at=row["started_at"],
             finished_at=row["finished_at"],
+            timings=timings,
         )
 
 

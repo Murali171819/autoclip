@@ -19,9 +19,22 @@ export interface Source {
   has_audio: boolean
   has_video: boolean
   created_at: string
+  timings?: Record<string, any> | null
 }
 
 export type JobStatus = 'queued' | 'running' | 'failed' | 'done' | 'cancelled'
+
+export interface StageTiming {
+  duration_seconds: number
+  status: 'completed' | 'failed' | 'cancelled' | 'cached' | 'skipped'
+  details?: Record<string, any>
+}
+
+export interface JobTimings {
+  pipeline_duration_seconds?: number
+  total_duration_seconds?: number
+  stages: Record<string, StageTiming>
+}
 
 export interface Job {
   id: string
@@ -36,6 +49,7 @@ export interface Job {
   started_at: string | null
   finished_at: string | null
   source: Source | null
+  timings?: JobTimings | null
 }
 
 export interface ExportRecord {

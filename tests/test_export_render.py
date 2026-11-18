@@ -414,3 +414,72 @@ def _frame_signature(video: Path, timestamp: float) -> str:
         check=True,
     )
     return result.stdout.strip()
+
+
+class TestEncoderArgs:
+    def test_software_fallback_uses_veryfast_preset(self, monkeypatch) -> None:
+        """When hardware encoding is disabled or unavailable, software fallback must use veryfast."""
+        from autoclip.system import FFmpegInfo, SystemReport
+
+        # Mock report to simulate no working nvenc
+        fake_report = SystemReport(
+            python_version="3.11",
+            python_ok=True,
+            platform="win32",
+            ffmpeg=FFmpegInfo(found=True, has_nvenc=False, nvenc_works=False),
+            gpu=None,  # type: ignore[arg-type]
+            deps=None,  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr("autoclip.pipeline.export.report", lambda: fake_report)
+
+        settings = ExportSettings(prefer_hardware_encoder=True, crf=18)
+        args = export.encoder_args(settings)
+
+        assert "-c:v" in args
+        codec_idx = args.index("-c:v")
+        assert args[codec_idx + 1] == "libx264"
+
+        assert "-preset" in args
+        preset_idx = args.index("-preset")
+        assert args[preset_idx + 1] == "veryfast"
+
+        assert "-crf" in args
+        crf_idx = args.index("-crf")
+        assert args[crf_idx + 1] == "18"
+
+        assert "-profile:v" in args
+        profile_idx = args.index("-profile:v")
+        assert args[profile_idx + 1] == "high"
+
+    def test_hardware_nvenc_preserved_when_available(self, monkeypatch) -> None:
+        """When hardware encoding is preferred and nvenc works, nvenc args are preserved."""
+        from autoclip.system import FFmpegInfo, SystemReport
+
+        fake_report = SystemReport(
+            python_version="3.11",
+            python_ok=True,
+            platform="win32",
+            ffmpeg=FFmpegInfo(found=True, has_nvenc=True, nvenc_works=True),
+            gpu=None,  # type: ignore[arg-type]
+            deps=None,  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr("autoclip.pipeline.export.report", lambda: fake_report)
+
+        settings = ExportSettings(prefer_hardware_encoder=True, crf=18)
+        args = export.encoder_args(settings)
+
+        assert args == [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            "18",
+            "-b:v",
+            "0",
+            "-profile:v",
+            "high",
+        ]
+

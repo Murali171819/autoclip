@@ -668,12 +668,20 @@ def serve(
         # Delayed so the browser doesn't race the server's first bind.
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
+    log_config = uvicorn.config.LOGGING_CONFIG.copy()
+    log_config.setdefault("loggers", {})["autoclip"] = {
+        "handlers": ["default"],
+        "level": "INFO",
+        "propagate": False,
+    }
+
     uvicorn.run(
         "autoclip.app:app",
         host=host,
         port=port,
         reload=reload,
         log_level="info",
+        log_config=log_config,
     )
 
 
